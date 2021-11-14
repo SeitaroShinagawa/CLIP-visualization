@@ -22,7 +22,7 @@ class MultiheadAttention(torch.nn.MultiheadAttention):
                  kdim=kdim, vdim=vdim, batch_first=batch_first, device=device, dtype=dtype)
         
     def forward(self, query: Tensor, key: Tensor, value: Tensor, key_padding_mask: Optional[Tensor] = None,
-                need_weights: bool = True, attn_mask: Optional[Tensor] = None) -> Tuple[Tensor, Optional[Tensor]]:
+                need_weights: bool = True, attn_mask: Optional[Tensor] = None, cond_attn: Optional[Tensor] = None) -> Tuple[Tensor, Optional[Tensor]]:
         
         if self.batch_first:
             query, key, value = [x.transpose(1, 0) for x in (query, key, value)]
@@ -38,7 +38,8 @@ class MultiheadAttention(torch.nn.MultiheadAttention):
                 key_padding_mask=key_padding_mask, need_weights=need_weights,
                 attn_mask=attn_mask, use_separate_proj_weight=True,
                 q_proj_weight=self.q_proj_weight, k_proj_weight=self.k_proj_weight,
-                v_proj_weight=self.v_proj_weight)
+                v_proj_weight=self.v_proj_weight,
+                cond_attn=cond_attn)
         else:
             attn_output, attn_output_weights = multi_head_attention_forward(
                 query, key, value, self.embed_dim, self.num_heads,
@@ -47,7 +48,9 @@ class MultiheadAttention(torch.nn.MultiheadAttention):
                 self.dropout, self.out_proj.weight, self.out_proj.bias,
                 training=self.training,
                 key_padding_mask=key_padding_mask, need_weights=need_weights,
-                attn_mask=attn_mask)
+                attn_mask=attn_mask,
+                cond_attn=cond_attn)
+        
         if self.batch_first:
             return attn_output.transpose(1, 0), attn_output_weights
         else:

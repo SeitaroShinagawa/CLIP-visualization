@@ -76,10 +76,12 @@ parser.add_argument("--visualize_posemb", action="store_true", help="visualize p
 parser.add_argument("--pos_vmax", default=1.2, type=float, help="max range for output figures for position embeddings")
 parser.add_argument("--pos_vmin", default=0.0, type=float, help="min range for output figures for position embeddings")
 parser.add_argument("--unifyfigs", action="store_true", help="unify figures into one figure")
+parser.add_argument("--layer_id", default=11, type=int, help="layer id to visualize (clip has range of 0 to 11)")
 args = parser.parse_args()
 
 p = Path(args.imgpath)
 savedir = args.savedir + "/" + p.stem
+print("outputs are saved to: ", savedir)
 if not os.path.exists(savedir):
     os.mkdir(savedir)
 
@@ -112,11 +114,11 @@ else:
 # Processing the image to get attention map
 image_input = preprocess(image).unsqueeze(0).to(device)
 with torch.no_grad():
-    image_attention_mh = model.encode_image_attention(image_input).to("cpu")
-
+    image_feat, image_attention_mh = model.encode_image_attention(image_input, return_attention=True, cond_attn=None, target_layer=args.layer_id) #N, head, query, key
+    image_attention_mh = image_attention_mh.to("cpu")
 # Get average attention over multi-heads
 n_head = image_attention_mh.shape[1]
-attention_mean = image_attention_mh.sum(dim=1) / n_head
+attention_mean = image_attention_mh[:,:,:,1:].sum(dim=1) / n_head #[:,:,:,1:] means removing cls token of key
 
 vmax = image_attention_mh.max()
 vmin = image_attention_mh.min()
@@ -128,6 +130,8 @@ print("Resize: 224 (default) -> {}".format(224*factor))
 print("Patrch size: 32 (default) -> {}".format(32//factor))
 print("Figure with range 0.0-{}".format(args.vmax))
 print("Figure for position embeddings with range 0.0-{}".format(args.vmax))
+print("Layer id to visualize: {}".format(args.layer_id))
+layer_id = args.layer_id
 
 # Visualize all in one figure
 if args.unifyfigs:
@@ -177,14 +181,14 @@ if args.unifyfigs:
         
         # Visualize atention over heads
         for head_id in range(n_head):
-            att_map = image_attention_mh[0, head_id, query_id].reshape(7*factor, 7*factor)
+            att_map = image_attention_mh[0, head_id, query_id, 1:].reshape(7*factor, 7*factor)
             subplot_figure(fig, n_h, n_w, 5+head_id, 
                         att_map, 
-                        title="head{:2d}".format(head_id), 
+                        title="layer{:2d}, head{:2d}".format(layer_id, head_id), 
                         fontsize=fontsize, 
                         vmin=0.0, vmax=args.vmax)   
             
-        fig.savefig(savedir + "/unified_query{:02d}.png".format(query_id))
+        fig.savefig(savedir + "/unified_layer{:02d}_query{:02d}.png".format(layer_id, query_id))
         plt.close()
 
 else: # Visualize each
@@ -202,7 +206,7 @@ else: # Visualize each
         cax = divider.append_axes("right", size="5%", pad=0.05)
         plt.colorbar(im, cax=cax)
         fig.subplots_adjust(hspace=0, wspace=0)
-        fig.savefig(savedir + "/attention_query{:02d}_average.png".format(query_id))
+        fig.savefig(savedir + "/attention_layer_{:02d}_query{:02d}_average.png".format(layer_id, query_id))
         plt.close()
 
         # For each head
@@ -211,13 +215,13 @@ else: # Visualize each
             for head_id in range(n_head):
                 ax = fig.add_subplot(n_head//4, 4, head_id+1)
                 ax.axis("off")
-                im = ax.pcolor(image_attention_mh[0, head_id, query_id].reshape(7*factor, 7*factor), norm=Normalize(vmin=0.0, vmax=args.vmax))
+                im = ax.pcolor(image_attention_mh[0, head_id, query_id, 1:].reshape(7*factor, 7*factor), norm=Normalize(vmin=0.0, vmax=args.vmax))
                 ax.invert_yaxis()
                 divider = make_axes_locatable(ax)
                 cax = divider.append_axes("right", size="5%", pad=0.05)
                 plt.colorbar(im, cax=cax)
                 fig.subplots_adjust(hspace=0.2, wspace=0.3)
-            fig.savefig(savedir + "/attention_query{:02d}_eachheads.png".format(query_id))
+            fig.savefig(savedir + "/attention_layer{:02d}_query{:02d}_eachheads.png".format(layer_id, query_id))
             plt.close()
 
     # Visualize position embeddings

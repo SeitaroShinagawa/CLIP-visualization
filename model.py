@@ -2,7 +2,7 @@
 # Original code: https://github.com/openai/CLIP
 
 from collections import OrderedDict
-from typing import Tuple, Union
+from typing import Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -10,6 +10,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from own_nn import MultiheadAttention
+
+Tensor = torch.Tensor
 
 class Bottleneck(nn.Module):
     expansion = 4
@@ -183,22 +185,16 @@ class ResidualAttentionBlock(nn.Module):
         self.ln_2 = LayerNorm(d_model)
         self.attn_mask = attn_mask
 
-    def attention(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, return_attention: bool=False, cond_attn: Optional[Tensor] = None): # Changed
+        x_ = self.ln_1(x)
         self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
-        return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
-
-    def attention_weight(self, x: torch.Tensor): # ADDED
-        self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
-        return self.attn(x, x, x, need_weights=True, attn_mask=self.attn_mask)[1]
-
-    def forward(self, x: torch.Tensor, return_attention: bool=False): # MODIFIED
-        if return_attention: # ADDED
-            return self.attention_weight(self.ln_1(x)) # ADDED
-
-        x = x + self.attention(self.ln_1(x))
+        attn_output, attn_output_weights = self.attn(x_, x_, x_, need_weights=return_attention, attn_mask=self.attn_mask, cond_attn=cond_attn)
+        x = x + attn_output
         x = x + self.mlp(self.ln_2(x))
-        return x
-
+        if return_attention: 
+            return x, attn_output_weights
+        else:
+            return x
 
 class Transformer(nn.Module):
     def __init__(self, width: int, layers: int, heads: int, attn_mask: torch.Tensor = None):
@@ -206,18 +202,24 @@ class Transformer(nn.Module):
         self.width = width
         self.layers = layers
         self.resblocks = nn.Sequential(*[ResidualAttentionBlock(width, heads, attn_mask) for _ in range(layers)])
-
+        self.n_layers = len(self.resblocks)
+        
     def forward(self, x: torch.Tensor):
         return self.resblocks(x)
 
-    # ADDED
-    def forward_attention(self, x: torch.Tensor):
+    def forward_with_attention(self, x: torch.Tensor, return_attention: bool=False, cond_attn: Optional[Tensor] = None, target_layer: int=0): # ADDED  
+        """
+        cond_atten: user specifiable attention (used for adversarial attention) 
+        target_layer: target to get attention
+        """
+        assert 0 <= target_layer <= self.n_layers - 1
         for index, layer in enumerate(self.resblocks):
-            if index == len(self.resblocks) - 1:
-                return layer(x, return_attention=True)
-            x = layer(x)
-
-
+            if index == target_layer:
+                x, attn_weights = layer(x, return_attention=return_attention, cond_attn=cond_attn)
+            else:
+                x = layer(x) 
+                
+        return x, attn_weights
 
 class VisualTransformer(nn.Module):
     def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int):
@@ -255,8 +257,7 @@ class VisualTransformer(nn.Module):
 
         return x
 
-    # ADDED
-    def forward_attention(self, x: torch.Tensor):
+    def forward_with_attention(self, x: torch.Tensor, return_attention: bool=False, cond_attn: Optional[Tensor] = None, target_layer: int=0): # ADDED
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
@@ -265,12 +266,8 @@ class VisualTransformer(nn.Module):
         x = self.ln_pre(x)
 
         x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer.forward_attention(x)
-        assert len(x.shape)==3 or len(x.shape)==4
-        if len(x.shape)==3:
-            return x[:, :, 1:]
-        else: 
-            return x[:, :, :, 1:]
+        x, attn_weights  = self.transformer.forward_with_attention(x, return_attention=return_attention, cond_attn=cond_attn, target_layer=target_layer)
+        return x, attn_weights
 
 
 class CLIP(nn.Module):
@@ -373,8 +370,18 @@ class CLIP(nn.Module):
     def encode_image(self, image):
         return self.visual(image.type(self.dtype))
 
-    def encode_image_attention(self, image):
-        return self.visual.forward_attention(image.type(self.dtype))
+    def encode_image_attention(self, image, return_attention: bool=False, cond_attn: Optional[Tensor] = None, target_layer: int=0):
+        """
+        cond_atten: user specifiable attention (used for adversarial attention) 
+        target_layer: target to get attention
+        """
+        image_features, attn_weights = self.visual.forward_with_attention(
+            image.type(self.dtype),
+            return_attention=return_attention,
+            cond_attn=cond_attn,
+            target_layer=target_layer
+            ) 
+        return image_features, attn_weights
 
     def encode_text(self, text):
         x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]
@@ -391,8 +398,19 @@ class CLIP(nn.Module):
 
         return x
 
-    def forward(self, image, text):
-        image_features = self.encode_image(image)
+    def forward(self, image, text, return_attention=False, cond_attn=None, target_layer=0):
+        assert 0 <= target_layer <= self.visual.transformer.n_layers-1
+        
+        if return_attention or cond_attn is not None:
+            image_features, attn_weights = \
+                self.encode_image_attention(image,
+                                            return_attention=return_attention,
+                                            cond_attn=cond_attn,
+                                            target_layer=target_layer
+                                           )
+        else:
+            image_features = self.encode_image(image)
+        
         text_features = self.encode_text(text)
 
         # normalized features
